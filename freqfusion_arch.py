@@ -10,9 +10,7 @@ class AdaptiveLowPassFilter(nn.Module):
         super(AdaptiveLowPassFilter, self).__init__()
         self.kernel_size = kernel_size
         self.padding = kernel_size // 2
-        
-        # 使用深度可分离卷积减少计算量
-        # 输出通道数 = kernel_size * kernel_size，表示每个空间位置的滤波核权重
+
         self.kernel_predictor = nn.Sequential(
             # 深度卷积：每个通道独立处理
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels),
@@ -30,7 +28,7 @@ class AdaptiveLowPassFilter(nn.Module):
         # 步骤 1: 预测滤波核权重 [B, K*K, H, W]
         # 每个空间位置 (h, w) 都有一组 K*K 个权重
         kernel_weights = self.kernel_predictor(x)
-        kernel_weights = F.softmax(kernel_weights, dim=1)  # 在核维度上归一化
+        kernel_weights = F.softmax(kernel_weights, dim=1) 
         
         # 步骤 2: 使用 unfold 提取每个位置的邻域
         # unfold 相当于滑动窗口，提取所有局部邻域
@@ -47,7 +45,6 @@ class AdaptiveLowPassFilter(nn.Module):
 
 
 class CrossAttentionAlignment(nn.Module):
-    """跨尺度特征对齐模块：通过交叉注意力机制隐式对齐 Decoder 和 Encoder 特征"""
     
     def __init__(self, dim, num_heads=8):
         super(CrossAttentionAlignment, self).__init__()
@@ -65,34 +62,27 @@ class CrossAttentionAlignment(nn.Module):
         self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
         
     def forward(self, dec_feat, enc_feat):
-        """
-        Args:
-            dec_feat: Decoder 特征 [B, C, H, W] - 作为 Query
-            enc_feat: Encoder 特征 [B, C, H, W] - 作为 Key 和 Value
-        Returns:
-            aligned_feat: 对齐后的特征 [B, C, H, W]
-        """
+        
         B, C, H, W = dec_feat.shape
         
         # 生成 Query, Key, Value
         q = self.q_proj(dec_feat)  # [B, C, H, W]
         kv = self.kv_proj(enc_feat)  # [B, 2*C, H, W]
         k, v = torch.chunk(kv, 2, dim=1)  # 各自 [B, C, H, W]
-        
-        # Reshape 为多头注意力格式
+
         # [B, C, H, W] -> [B, num_heads, H*W, head_dim]
         q = q.reshape(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
         k = k.reshape(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
         v = v.reshape(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
         
-        # 计算注意力: Q @ K^T
+        # 计算注意力
         attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, H*W, H*W]
         attn = attn.softmax(dim=-1)
         
-        # 加权求和: Attn @ V
+        # 加权求和
         out = attn @ v  # [B, num_heads, H*W, head_dim]
         
-        # Reshape 回原始形状
+        # Reshape
         out = out.permute(0, 1, 3, 2).reshape(B, C, H, W)
         
         # 输出投影
@@ -142,8 +132,7 @@ class AdaptiveHighPassFilter(nn.Module):
 
 
 class FreqFusionBlock(nn.Module):
-    """频域感知特征融合模块：结合自适应滤波和跨尺度注意力"""
-    
+   
     def __init__(self, in_channels, kernel_size=3, num_heads=8, 
                  use_alpf=True, use_attention=True, use_ahpf=True):
         super(FreqFusionBlock, self).__init__()
@@ -168,14 +157,7 @@ class FreqFusionBlock(nn.Module):
         self.fusion_conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
         
     def forward(self, dec_feat, enc_feat, w=1.0):
-        """
-        Args:
-            dec_feat: Decoder 特征 [B, C, H, W]
-            enc_feat: Encoder 特征 [B, C, H, W]（skip connection）
-            w: 高频特征的权重系数
-        Returns:
-            fused_feat: 融合后的特征 [B, C, H, W]
-        """
+
         
         # ============ Path 1: 低通平滑 ============
         if self.use_alpf:
