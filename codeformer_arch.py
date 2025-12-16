@@ -169,25 +169,7 @@ class CodeFormer(VQAutoEncoder):
                 fix_modules=['quantize','generator'], vqgan_path=None,
                 use_hilbert=False, use_freqfusion=False,
                 freqfusion_config=None):
-        """
-        CodeFormer 架构（支持 Hift-Former 扩展和细粒度消融实验）
         
-        参数:
-            dim_embd (int): Transformer 的嵌入维度
-            n_head (int): 多头注意力的头数
-            n_layers (int): Transformer 层数
-            codebook_size (int): Codebook 大小
-            latent_size (int): Latent 特征的序列长度 (H×W)
-            connect_list (list): 需要融合的分辨率列表
-            fix_modules (list): 需要冻结的模块列表
-            vqgan_path (str): VQGAN 预训练权重路径
-            use_hilbert (bool): 是否使用希尔伯特序列化
-            use_freqfusion (bool): 是否使用 FreqFusion
-            freqfusion_config (dict): FreqFusion 细粒度配置
-                - use_alpf (bool): 是否使用 ALPF (Path 1)，默认 True
-                - use_offset (bool): 是否使用 Offset (Path 2)，默认 True
-                - use_ahpf (bool): 是否使用 AHPF (Path 3)，默认 True
-        """
         
         super(CodeFormer, self).__init__(512, 64, [1, 2, 2, 4, 4, 8], 'nearest',2, [16], codebook_size)
 
@@ -248,22 +230,22 @@ class CodeFormer(VQAutoEncoder):
         if freqfusion_config is None:
             freqfusion_config = {
                 'use_alpf': True,
-                'use_offset': True,
+                'use_attention': True,
                 'use_ahpf': True
             }
         self.freqfusion_config = freqfusion_config
         
-        # fuse_convs_dict - 可选使用 FreqFusion（支持细粒度消融实验）
+        # fuse_convs_dict - 可选使用 FreqFusion
         self.use_freqfusion = use_freqfusion
         self.fuse_convs_dict = nn.ModuleDict()
         for f_size in self.connect_list:
             in_ch = self.channels[f_size]
             if self.use_freqfusion:
-                # 使用 FreqFusion 替代原有的 Fuse_sft_block（传递细粒度配置）
+                # 使用 FreqFusion 
                 self.fuse_convs_dict[f_size] = FreqFusionBlock(
                     in_ch,
                     use_alpf=freqfusion_config.get('use_alpf', True),
-                    use_offset=freqfusion_config.get('use_offset', True),
+                    use_attention=freqfusion_config.get('use_attention', True),
                     use_ahpf=freqfusion_config.get('use_ahpf', True)
                 )
             else:
@@ -276,8 +258,8 @@ class CodeFormer(VQAutoEncoder):
             enabled_paths = []
             if freqfusion_config.get('use_alpf', True):
                 enabled_paths.append('ALPF')
-            if freqfusion_config.get('use_offset', True):
-                enabled_paths.append('Offset')
+            if freqfusion_config.get('use_attention', True):
+                enabled_paths.append('Attention')
             if freqfusion_config.get('use_ahpf', True):
                 enabled_paths.append('AHPF')
             
@@ -310,7 +292,6 @@ class CodeFormer(VQAutoEncoder):
 
         
         if self.use_hilbert:
-            # 使用希尔伯特曲线序列化保持空间局部性
             # BCHW -> BLC
             lq_feat_seq = self.hilbert_perm.to_sequence(lq_feat)  # [B, L=256, C=256]
             # BLC -> LBC

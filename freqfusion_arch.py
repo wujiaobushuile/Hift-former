@@ -46,77 +46,59 @@ class AdaptiveLowPassFilter(nn.Module):
         return x_smooth
 
 
-class SimilarityGuidedOffsetGenerator(nn.Module):
+class CrossAttentionAlignment(nn.Module):
+    """跨尺度特征对齐模块：通过交叉注意力机制隐式对齐 Decoder 和 Encoder 特征"""
     
-    
-    def __init__(self, in_channels, kernel_size=3, max_offset=0.1):
-        super(SimilarityGuidedOffsetGenerator, self).__init__()
-        self.kernel_size = kernel_size
-        self.padding = kernel_size // 2
-        self.max_offset = max_offset
+    def __init__(self, dim, num_heads=8):
+        super(CrossAttentionAlignment, self).__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
         
-        # 偏移预测网络：输入 = 特征 + 相似度图
-        predictor_in_channels = in_channels + kernel_size * kernel_size
-        self.offset_predictor = nn.Sequential(
-            nn.Conv2d(predictor_in_channels, in_channels // 4, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(in_channels // 4, 2, kernel_size=3, padding=1),
-            nn.Tanh()
-        )
-    
-    def compute_local_cosine_similarity(self, x):
-       
-        B, C, H, W = x.shape
+        assert dim % num_heads == 0, f"dim ({dim}) 必须能被 num_heads ({num_heads}) 整除"
         
-        # 使用 unfold 提取所有局部邻域
-        # x_unfold: [B, C*K*K, H*W]
-        x_unfold = F.unfold(x, kernel_size=self.kernel_size, padding=self.padding)
-        x_unfold = x_unfold.view(B, C, self.kernel_size * self.kernel_size, H * W)
+        # Query 来自 Decoder 特征
+        self.q_proj = nn.Conv2d(dim, dim, kernel_size=1)
+        # Key 和 Value 来自 Encoder 特征
+        self.kv_proj = nn.Conv2d(dim, dim * 2, kernel_size=1)
+        # 输出投影
+        self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
         
-        # 中心像素（展平）
-        center = x.view(B, C, H * W).unsqueeze(2)  # [B, C, 1, H*W]
+    def forward(self, dec_feat, enc_feat):
+        """
+        Args:
+            dec_feat: Decoder 特征 [B, C, H, W] - 作为 Query
+            enc_feat: Encoder 特征 [B, C, H, W] - 作为 Key 和 Value
+        Returns:
+            aligned_feat: 对齐后的特征 [B, C, H, W]
+        """
+        B, C, H, W = dec_feat.shape
         
-        # 计算余弦相似度
-        # 分子：点积
-        numerator = (x_unfold * center).sum(dim=1)  # [B, K*K, H*W]
+        # 生成 Query, Key, Value
+        q = self.q_proj(dec_feat)  # [B, C, H, W]
+        kv = self.kv_proj(enc_feat)  # [B, 2*C, H, W]
+        k, v = torch.chunk(kv, 2, dim=1)  # 各自 [B, C, H, W]
         
-        # 分母：L2 范数乘积
-        center_norm = torch.norm(center, p=2, dim=1) + 1e-8  # [B, 1, H*W]
-        neighbor_norm = torch.norm(x_unfold, p=2, dim=1) + 1e-8  # [B, K*K, H*W]
-        denominator = center_norm * neighbor_norm  # [B, K*K, H*W]
+        # Reshape 为多头注意力格式
+        # [B, C, H, W] -> [B, num_heads, H*W, head_dim]
+        q = q.reshape(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
+        k = k.reshape(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
+        v = v.reshape(B, self.num_heads, self.head_dim, H * W).permute(0, 1, 3, 2)
         
-        # 相似度
-        similarity = numerator / denominator  # [B, K*K, H*W]
-        similarity = similarity.view(B, self.kernel_size * self.kernel_size, H, W)
+        # 计算注意力: Q @ K^T
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, H*W, H*W]
+        attn = attn.softmax(dim=-1)
         
-        return similarity
+        # 加权求和: Attn @ V
+        out = attn @ v  # [B, num_heads, H*W, head_dim]
         
-    def forward(self, x):
-       
-        B, C, H, W = x.shape
+        # Reshape 回原始形状
+        out = out.permute(0, 1, 3, 2).reshape(B, C, H, W)
         
-        # 步骤 1: 计算局部余弦相似度
-        similarity = self.compute_local_cosine_similarity(x)  # [B, K*K, H, W]
+        # 输出投影
+        out = self.out_proj(out)
         
-        # 步骤 2: 基于相似度预测偏移量
-        features = torch.cat([x, similarity], dim=1)
-        offset = self.offset_predictor(features) * self.max_offset  # [B, 2, H, W]
-        
-        # 步骤 3: 创建采样网格
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, H, device=x.device),
-            torch.linspace(-1, 1, W, device=x.device),
-            indexing='ij'
-        )
-        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)
-        
-        # 步骤 4: 应用偏移并重采样
-        offset_grid = grid + offset.permute(0, 2, 3, 1)
-        x_warped = F.grid_sample(
-            x, offset_grid, mode='bilinear', padding_mode='border', align_corners=True
-        )
-        
-        return x_warped
+        return out
 
 
 class AdaptiveHighPassFilter(nn.Module):
@@ -143,7 +125,6 @@ class AdaptiveHighPassFilter(nn.Module):
         W_LP = F.softmax(W_LP, dim=1)
         
         # 步骤 2: 滤波器反转
-        # δ (Dirac delta) 在中心位置为 1，其他位置为 0
         delta = torch.zeros_like(W_LP)
         center_idx = self.kernel_size * self.kernel_size // 2
         delta[:, center_idx, :, :] = 1.0
@@ -161,26 +142,25 @@ class AdaptiveHighPassFilter(nn.Module):
 
 
 class FreqFusionBlock(nn.Module):
+    """频域感知特征融合模块：结合自适应滤波和跨尺度注意力"""
     
-    
-    def __init__(self, in_channels, kernel_size=3, use_alpf=True, use_offset=True, use_ahpf=True):
-        
+    def __init__(self, in_channels, kernel_size=3, num_heads=8, 
+                 use_alpf=True, use_attention=True, use_ahpf=True):
         super(FreqFusionBlock, self).__init__()
         
-        # 保存配置
         self.use_alpf = use_alpf
-        self.use_offset = use_offset
+        self.use_attention = use_attention
         self.use_ahpf = use_ahpf
         
-        # Path 1: ALPF
+        # Path 1: 自适应低通滤波（去噪、抗混叠）
         if self.use_alpf:
             self.alpf = AdaptiveLowPassFilter(in_channels, kernel_size)
         
-        # Path 2: Offset
-        if self.use_offset:
-            self.offset_generator = SimilarityGuidedOffsetGenerator(in_channels, kernel_size)
+        # Path 2: 跨尺度注意力对齐（隐式特征对齐）
+        if self.use_attention:
+            self.cross_attn = CrossAttentionAlignment(in_channels, num_heads)
         
-        # Path 3: AHPF
+        # Path 3: 自适应高通滤波（细节增强）
         if self.use_ahpf:
             self.ahpf = AdaptiveHighPassFilter(in_channels, kernel_size)
         
@@ -188,34 +168,36 @@ class FreqFusionBlock(nn.Module):
         self.fusion_conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
         
     def forward(self, dec_feat, enc_feat, w=1.0):
+        """
+        Args:
+            dec_feat: Decoder 特征 [B, C, H, W]
+            enc_feat: Encoder 特征 [B, C, H, W]（skip connection）
+            w: 高频特征的权重系数
+        Returns:
+            fused_feat: 融合后的特征 [B, C, H, W]
+        """
         
-        
-        # ============ Path 1: 低频平滑路径 ============
+        # ============ Path 1: 低通平滑 ============
         if self.use_alpf:
-            # 对 Decoder 特征进行自适应平滑，去除噪声和混叠
             f_smooth = self.alpf(dec_feat)
         else:
-            # 消融实验：跳过 ALPF，直接使用原始 Decoder 特征
             f_smooth = dec_feat
         
-        # ============ Path 2: 空间对齐路径 ============
-        if self.use_offset:
-            # 预测偏移量并对平滑后的特征进行变形，校正空间错位
-            f_resamp = self.offset_generator(f_smooth)
+        # ============ Path 2: 跨尺度对齐 ============
+        if self.use_attention:
+            # 通过交叉注意力隐式对齐 Decoder 和 Encoder 特征
+            f_aligned = self.cross_attn(f_smooth, enc_feat)
         else:
-            # 消融实验：跳过 Offset，直接使用 f_smooth
-            f_resamp = f_smooth
+            f_aligned = f_smooth
         
-        # ============ Path 3: 高频增强路径 ============
+        # ============ Path 3: 高频增强 ============
         if self.use_ahpf:
-            # 从 Encoder 特征中提取高频细节
             f_high = self.ahpf(enc_feat)
         else:
-            # 消融实验：跳过 AHPF，直接使用原始 Encoder 特征
             f_high = enc_feat
-
-        f_out = f_resamp + w * f_high
         
+        # ============ 特征融合 ============
+        f_out = f_aligned + w * f_high
         f_out = self.fusion_conv(f_out)
         
         return f_out
